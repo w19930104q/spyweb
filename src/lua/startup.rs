@@ -224,6 +224,7 @@ global_store_set("hook_seen", "yes")
             project.path().join("missing.toml").to_str().unwrap(),
             project.path().join("jobs").to_str().unwrap(),
             Arc::clone(&db),
+            loader::empty_controls(),
         )
         .unwrap();
 

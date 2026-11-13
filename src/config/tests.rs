@@ -32,6 +32,7 @@ fn mock_job(hash_fields: Option<Vec<&str>>) -> JobConfig {
                 .map(|fields| fields.into_iter().map(ToOwned::to_owned).collect()),
             workers: None,
             urls: None,
+            cycle_timeout_secs: 0,
         },
     }
 }
@@ -232,7 +233,8 @@ fields = ["title:.title"]
 
     let db_path = dir.path().join("test.redb");
     let db = Arc::new(crate::services::db::Db::open(db_path.to_str().unwrap()).unwrap());
-    let jobs = loader::load_dir_jobs(dir.path().to_str().unwrap(), db).unwrap();
+    let jobs =
+        loader::load_dir_jobs(dir.path().to_str().unwrap(), db, loader::empty_controls()).unwrap();
 
     assert_eq!(jobs.len(), 1);
     assert!(!jobs[0].config.options.enabled);

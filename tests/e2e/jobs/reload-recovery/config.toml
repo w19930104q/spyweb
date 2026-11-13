@@ -1,0 +1,15 @@
+name = "reload-recovery"
+url = "http://127.0.0.1:1/page"
+selector = ".item"
+fields = ["title:h2"]
+enabled = true
+interval = 999999
+workers = 2
+# Explicit per-cycle timeout: exercised by the cooperative-cancel tests.
+cycle_timeout_secs = 1
+# Seed batch => the job runs through the durable queue machinery.
+urls = [
+    "http://127.0.0.1:1/page/seed-1",
+    "http://127.0.0.1:1/page/seed-2",
+    "http://127.0.0.1:1/page/seed-3",
+]

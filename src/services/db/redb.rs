@@ -8,6 +8,8 @@ use std::collections::HashMap;
 const RECORDS: TableDefinition<(&str, u64), &str> = TableDefinition::new("records");
 const SEEN: TableDefinition<&str, u8> = TableDefinition::new("seen");
 const LUA_USER: TableDefinition<&str, &str> = TableDefinition::new("lua_user");
+// Durable queue-cycle state, keyed (job_id, url); value is the enqueue generation.
+const QUEUE_URLS: TableDefinition<(&str, &str), u64> = TableDefinition::new("queue_urls");
 
 const DB_CACHE_SIZE_BYTES: usize = 128 * 1024;
 
@@ -24,6 +26,7 @@ impl RedbBackend {
         write.open_table(RECORDS)?;
         write.open_table(SEEN)?;
         write.open_table(LUA_USER)?;
+        write.open_table(QUEUE_URLS)?;
         write.commit()?;
         Ok(Self { db })
     }
@@ -185,6 +188,75 @@ impl RedbBackend {
         };
         write.commit()?;
         Ok(result)
+    }
+
+    // Durable queue-cycle state. Rows are removed only when the URL completes,
+    // so an interrupted cycle leaves its unfinished URLs recoverable on reopen.
+    pub fn queue_enqueue(&self, job_id: &str, urls: &[String], generation: u64) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(QUEUE_URLS)?;
+            for url in urls {
+                // Keep the original generation for an URL that is still pending.
+                if table.get((job_id, url.as_str()))?.is_none() {
+                    table.insert((job_id, url.as_str()), generation)?;
+                }
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    pub fn queue_reclaim(&self, job_id: &str) -> Result<Vec<String>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(QUEUE_URLS)?;
+        let mut urls = Vec::new();
+        for entry in table.iter()?.flatten() {
+            let (stored_job, url) = entry.0.value();
+            if stored_job == job_id {
+                urls.push(url.to_string());
+            }
+        }
+        Ok(urls)
+    }
+
+    pub fn queue_complete(&self, job_id: &str, url: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(QUEUE_URLS)?;
+            table.remove((job_id, url))?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    pub fn queue_clear(&self, job_id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(QUEUE_URLS)?;
+            let drained: Vec<String> = table
+                .iter()?
+                .flatten()
+                .filter(|entry| entry.0.value().0 == job_id)
+                .map(|entry| entry.0.value().1.to_string())
+                .collect();
+            for url in drained {
+                table.remove((job_id, url.as_str()))?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    pub fn queue_depth(&self, job_id: &str) -> Result<usize> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(QUEUE_URLS)?;
+        let count = table
+            .iter()?
+            .flatten()
+            .filter(|entry| entry.0.value().0 == job_id)
+            .count();
+        Ok(count)
     }
 }
 
@@ -412,5 +484,91 @@ mod tests {
         // Newest-first ordering within each job
         let a_recs = limited.get(&id_a).unwrap();
         assert!(a_recs[0].timestamp > a_recs[1].timestamp);
+    }
+
+    #[test]
+    fn test_durable_queue_lifecycle_and_recovery() {
+        let tdb = TestDb::new("redb_test_durable_queue");
+        let job_id = "durable-job";
+
+        // Empty queue reclaims nothing.
+        assert!(tdb.db().queue_reclaim(job_id).unwrap().is_empty());
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 0);
+
+        // Enqueue seeds pending rows.
+        let urls = vec![
+            "https://a.test/1".to_string(),
+            "https://a.test/2".to_string(),
+            "https://a.test/3".to_string(),
+        ];
+        tdb.db().queue_enqueue(job_id, &urls, 1).unwrap();
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 3);
+
+        // Re-enqueue must be idempotent and keep the original generation.
+        tdb.db()
+            .queue_enqueue(
+                job_id,
+                &[
+                    "https://a.test/2".to_string(),
+                    "https://a.test/4".to_string(),
+                ],
+                2,
+            )
+            .unwrap();
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 4);
+
+        // Reclaim returns every pending URL.
+        let pending = tdb.db().queue_reclaim(job_id).unwrap();
+        for url in &urls {
+            assert!(pending.contains(url), "missing {url} after reclaim");
+        }
+        assert!(pending.contains(&"https://a.test/4".to_string()));
+
+        // Completing one URL removes exactly its row.
+        tdb.db().queue_complete(job_id, "https://a.test/1").unwrap();
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 3);
+        let pending = tdb.db().queue_reclaim(job_id).unwrap();
+        assert!(!pending.contains(&"https://a.test/1".to_string()));
+
+        // A different job id shares neither rows nor the reclaim set.
+        tdb.db()
+            .queue_enqueue("other-job", &["https://b.test/x".to_string()], 1)
+            .unwrap();
+        assert_eq!(tdb.db().queue_depth("other-job").unwrap(), 1);
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 3);
+
+        // Clearing one job leaves the other untouched.
+        tdb.db().queue_clear(job_id).unwrap();
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 0);
+        assert_eq!(tdb.db().queue_depth("other-job").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_durable_queue_survives_reopen() {
+        let path = "redb_test_durable_reopen.redb";
+        let _ = fs::remove_file(path);
+
+        {
+            let db = RedbBackend::open(path).unwrap();
+            db.queue_enqueue(
+                "restart-job",
+                &[
+                    "https://r.test/a".to_string(),
+                    "https://r.test/b".to_string(),
+                ],
+                7,
+            )
+            .unwrap();
+            db.queue_complete("restart-job", "https://r.test/a")
+                .unwrap();
+            db.close().unwrap();
+        }
+
+        // Simulate a process restart: reopen and recover the unfinished URL.
+        let reopened = RedbBackend::open(path).unwrap();
+        let pending = reopened.queue_reclaim("restart-job").unwrap();
+        assert_eq!(pending, vec!["https://r.test/b".to_string()]);
+        drop(reopened);
+        let _ = fs::remove_file(path);
     }
 }

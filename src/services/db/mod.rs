@@ -159,6 +159,58 @@ impl Db {
             Backend::Redb(_) => anyhow::bail!("db_exec is only available in the sqlite backend"),
         })
     }
+
+    /// Add URLs to the durable per-job queue. Already-pending URLs keep their
+    /// original generation. Used by queue cycles so unfinished work survives
+    /// cancellation, hot reload and process restart.
+    pub fn queue_enqueue(&self, job_id: &str, urls: &[String], generation: u64) -> Result<()> {
+        self.with_backend(|backend| match backend {
+            #[cfg(feature = "redb")]
+            Backend::Redb(b) => b.queue_enqueue(job_id, urls, generation),
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(b) => b.queue_enqueue(job_id, urls, generation as i64),
+        })
+    }
+
+    /// All URLs still pending for a job when the previous process/cycle ended.
+    pub fn queue_reclaim(&self, job_id: &str) -> Result<Vec<String>> {
+        self.with_backend(|backend| match backend {
+            #[cfg(feature = "redb")]
+            Backend::Redb(b) => b.queue_reclaim(job_id),
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(b) => b.queue_reclaim(job_id),
+        })
+    }
+
+    /// Mark one URL finished (success or a terminal failure) and drop its row.
+    pub fn queue_complete(&self, job_id: &str, url: &str) -> Result<()> {
+        self.with_backend(|backend| match backend {
+            #[cfg(feature = "redb")]
+            Backend::Redb(b) => b.queue_complete(job_id, url),
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(b) => b.queue_complete(job_id, url),
+        })
+    }
+
+    /// Drop every pending URL for a job (e.g. a queue cycle that ended idle).
+    pub fn queue_clear(&self, job_id: &str) -> Result<()> {
+        self.with_backend(|backend| match backend {
+            #[cfg(feature = "redb")]
+            Backend::Redb(b) => b.queue_clear(job_id),
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(b) => b.queue_clear(job_id),
+        })
+    }
+
+    /// Number of URLs still pending for a job.
+    pub fn queue_depth(&self, job_id: &str) -> Result<usize> {
+        self.with_backend(|backend| match backend {
+            #[cfg(feature = "redb")]
+            Backend::Redb(b) => b.queue_depth(job_id),
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(b) => b.queue_depth(job_id),
+        })
+    }
 }
 
 #[cfg(test)]

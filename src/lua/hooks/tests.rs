@@ -66,7 +66,15 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = Arc::new(JobHooks::load(&hook_path, db, "test_job").unwrap());
+    let hooks = Arc::new(
+        JobHooks::load(
+            &hook_path,
+            db,
+            "test_job",
+            crate::scraper::control::JobControl::new(),
+        )
+        .unwrap(),
+    );
 
     let phase = smol::block_on(async {
         let ctx1 = hooks.new_cycle_context(1).await.unwrap();
@@ -145,7 +153,15 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = Arc::new(JobHooks::load(&hook_path, db, "test_job").unwrap());
+    let hooks = Arc::new(
+        JobHooks::load(
+            &hook_path,
+            db,
+            "test_job",
+            crate::scraper::control::JobControl::new(),
+        )
+        .unwrap(),
+    );
     assert!(hooks.hook_mask & HOOK_ON_SUCCESS != 0);
 
     let w2_elapsed = smol::block_on(async {
@@ -202,7 +218,15 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = Arc::new(JobHooks::load(&hook_path, db, "test_job").unwrap());
+    let hooks = Arc::new(
+        JobHooks::load(
+            &hook_path,
+            db,
+            "test_job",
+            crate::scraper::control::JobControl::new(),
+        )
+        .unwrap(),
+    );
     let (ex, _keep_alive) = single_thread_executor();
 
     let ctx1 = smol::block_on(hooks.new_cycle_context(1)).unwrap();
@@ -258,7 +282,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     let attempt = FetchAttempt {
         request: RequestConfig {
@@ -324,7 +354,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(hooks.has_override_fetch());
 
     let req = RequestConfig {
@@ -386,7 +422,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(hooks.has_override_extract());
 
     let res = RequestResult {
@@ -439,7 +481,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     let req = RequestConfig {
         url: "https://example.com".into(),
@@ -514,7 +562,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(hooks.hook_mask & HOOK_ON_SUCCESS != 0);
     assert!(hooks.hook_mask & HOOK_ON_ERROR != 0);
     assert!(hooks.hook_mask & HOOK_ON_FINALLY != 0);
@@ -583,7 +637,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let ctx = hooks.new_cycle_context(0).await.unwrap();
@@ -648,7 +708,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(hooks.hook_mask & HOOK_ON_SUCCESS == 0);
 
     smol::block_on(async {
@@ -678,7 +744,13 @@ fn telemetry_table_records_active_stages_and_cleans_up() {
     fs::write(&hook_path, "").unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let ctx = hooks.new_cycle_context(0).await.unwrap();
@@ -760,7 +832,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let ctx = hooks.new_cycle_context(0).await.unwrap();
@@ -818,7 +896,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let ctx = hooks.new_cycle_context(0).await.unwrap();
@@ -883,7 +967,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let ctx = hooks.new_cycle_context(0).await.unwrap();
@@ -940,7 +1030,13 @@ end
 
     let db_path = dir.join("test.redb");
     let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let job = Arc::new(Job {
         config: JobConfig {
             name: "test_job".into(),
@@ -1033,7 +1129,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(
         hooks.hook_mask & HOOK_ON_FINISHED != 0,
         "HOOK_ON_FINISHED should be set in mask"
@@ -1080,7 +1182,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(hooks.hook_mask & HOOK_ON_FINISHED != 0);
 
     smol::block_on(async {
@@ -1121,7 +1229,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let stats = crate::scraper::pipeline::CycleStats::new();
@@ -1166,7 +1280,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let stats = crate::scraper::pipeline::CycleStats::new();
@@ -1208,7 +1328,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         // Must not panic; defer raises inside the hook, error is log-only.
@@ -1246,7 +1372,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(
         hooks.hook_mask & HOOK_ON_FINISHED != 0,
         "on_finished should be detected without defer.lua"
@@ -1289,7 +1421,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(hooks.hook_mask & HOOK_ON_FINISHED != 0);
 
     smol::block_on(async {
@@ -1319,7 +1457,13 @@ _G.ran = false
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(
         hooks.hook_mask & HOOK_ON_FINISHED == 0,
         "mask should NOT have HOOK_ON_FINISHED when on_finished is not defined"
@@ -1363,7 +1507,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let ctx = hooks.new_cycle_context(0).await.unwrap();
@@ -1407,7 +1557,13 @@ end
 
     let db_path = dir.join("test.redb");
     let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     let job = Arc::new(Job {
         config: JobConfig {
@@ -1482,7 +1638,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
 
     smol::block_on(async {
         let ctx = hooks.new_cycle_context(0).await.unwrap();
@@ -1520,7 +1682,13 @@ fn on_start_result(source: &str, seed: Option<Vec<&str>>) -> Option<Vec<String>>
     fs::write(&hook_path, source).unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let seed = seed.map(|v| v.into_iter().map(String::from).collect());
     let result = smol::block_on(hooks.run_on_start(seed));
 
@@ -1892,7 +2060,13 @@ fn test_on_start_mask_gate_without_hook() {
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(!hooks.has_on_start());
 
     let seed = Some(vec!["seed".to_string()]);
@@ -1912,7 +2086,13 @@ fn test_on_start_mask_detect() {
     fs::write(&hook_path, "function on_start(queue) end\n").unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, db, "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        db,
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     assert!(hooks.has_on_start());
     assert!(hooks.hook_mask & HOOK_ON_START != 0);
 

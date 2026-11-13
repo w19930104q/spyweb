@@ -60,7 +60,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let job = Job {
         config: JobConfig {
             name: "test job".into(),
@@ -173,7 +179,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let job = Job {
         config: JobConfig {
             name: "test job".into(),
@@ -232,7 +244,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let job = Arc::new(Job {
         config: JobConfig {
             name: "test job".into(),
@@ -305,7 +323,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let job = Arc::new(Job {
         config: JobConfig {
             name: "test job".into(),
@@ -380,7 +404,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let job = Arc::new(Job {
         config: JobConfig {
             name: "test job".into(),
@@ -496,7 +526,13 @@ end
     .unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let job = Arc::new(Job {
         config: JobConfig {
             name: "test job".into(),
@@ -798,7 +834,13 @@ fn make_job_with_hooks(
     fs::write(&hook_path, hook_source).unwrap();
 
     let db = Arc::new(Db::open(dir.join("test.redb").to_str().unwrap()).unwrap());
-    let hooks = JobHooks::load(&hook_path, Arc::clone(&db), "test_job").unwrap();
+    let hooks = JobHooks::load(
+        &hook_path,
+        Arc::clone(&db),
+        "test_job",
+        crate::scraper::control::JobControl::new(),
+    )
+    .unwrap();
     let job = Job {
         config: JobConfig {
             name: "test_job".into(),
@@ -1801,9 +1843,11 @@ fn queue_push_over_cap_rejects_combined_initial_and_pushed() {
     let job = Arc::new(job);
     let hooks = job.hooks.as_ref().unwrap();
     let (tx, _rx) = smol::channel::unbounded::<crate::scraper::coordinator::Message>();
-    hooks
-        .queue
-        .begin_cycle(tx, crate::config::types::MAX_BATCH - 1);
+    hooks.queue.begin_cycle(
+        tx,
+        crate::config::types::MAX_BATCH - 1,
+        crate::scraper::control::CycleToken::new(1),
+    );
 
     smol::block_on(async {
         let lua = hooks.lua.lock().await;
@@ -1993,9 +2037,14 @@ end
     let job = Arc::new(job);
     // Cycle 1's real fetch runs via smol::unblock against a blackhole address;
     // dropping the cycle future abandons the fetch future (the blocking
-    // closure completes on the pool harmlessly). Cycle 2 nil-skips instead.
+    // closure completes on the pool harmlessly). Its URL stays in the durable
+    // queue, so cycle 2 resumes it and nil-skips it alongside its own seed.
     let stats = run_cancel_then_next_cycle(&job, &db, 400);
-    assert_eq!(stats.processed(), 1, "cycle 2 nil-skip counts as processed");
+    assert_eq!(
+        stats.processed(),
+        2,
+        "recovered URL plus cycle 2 seed both nil-skip as processed"
+    );
     assert_eq!(stats.failed(), 0);
 
     smol::block_on(async {
@@ -2003,7 +2052,7 @@ end
         let cycle: usize = lua.globals().get("cycle").unwrap();
         assert_eq!(cycle, 2, "both cycles started");
         let counts: Vec<usize> = lua.globals().get("final_counts").unwrap();
-        assert_eq!(counts, vec![1, 0, 0, 0]);
+        assert_eq!(counts, vec![2, 0, 0, 0]);
     });
 
     drop(job);

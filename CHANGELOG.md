@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Hot Reload:** Config changes now apply at the next job-cycle boundary instead of cancelling the running cycle. The in-flight cycle keeps its old config and closes out naturally; the job is then rebuilt from the new config. A monotonic reload epoch (acknowledged by the job loop, re-armed by the manager) ensures a reload landing between cycles is never lost and a respawned task never inherits a stale signal.
+- **Configuration:** New per-job `cycle_timeout_secs` option (default `0` = unbounded). When set, a cycle that runs past the limit is cancelled cooperatively: workers unwind at their next await rather than being killed mid-operation.
+- **Durability:** Accepted URLs (including mid-run `queue_push` pages) are written to a durable `queue_urls` table before dispatch and removed only on success. A cancelled cycle leaves its unfinished URLs persisted; they are reclaimed on the next cycle or after a process restart. Both the redb and SQLite backends support the queue, which survives a database reopen.
+- **Side-effect gates:** Each cycle installs a one-shot token checked immediately before the database insert, desktop/webhook notification, and the Lua `notify` global. Results arriving after a timeout, reload drain, or shutdown are neither stored nor notified; a late Lua `notify` returns a runtime error instead of sending an alert. Combined with the dedupe table, interrupted-and-resumed runs never produce duplicate rows or notifications.
+- **Tests:** End-to-end suite covering a mid-cycle config change, cooperative timeout cancellation, process restart with durable resume, and duplicate-notification suppression, run against a deterministic local pagination fixture on both storage backends.
+
+### Changed
+- **Runtime:** Reload/shutdown now drains old job tasks to their cycle boundary (bounded by the largest `cycle_timeout_secs` plus a grace window) and force-cancels only stragglers; browsers owned by old Lua VMs are torn down after the tasks unwind rather than up front.
+
 ## [1.6.0] - 2026-11-11
 
 ### Added

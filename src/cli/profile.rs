@@ -19,7 +19,7 @@ pub enum ProfileCommands {
 
 fn load_jobs_for_profiles() -> anyhow::Result<Jobs> {
     let db = Arc::new(Db::open("data")?);
-    loader::load_all_jobs("jobs.toml", "jobs", db)
+    loader::load_all_jobs("jobs.toml", "jobs", db, loader::empty_controls())
 }
 
 fn print_profile_check(job: &Job) -> anyhow::Result<()> {

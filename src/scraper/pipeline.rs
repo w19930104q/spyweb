@@ -1,4 +1,5 @@
-use crate::scraper::coordinator::{Message, QueueState};
+use crate::scraper::control::{CycleToken, JobControl};
+use crate::scraper::coordinator::{DurableQueue, Message, QueueState};
 use crate::{
     color, config::types::Job, lua::hooks::TelemetryHandle, scraper::request::RequestConfig,
     scraper::runner::Runner, services::db::Db, services::notifier, services::webhook,
@@ -16,6 +17,19 @@ use std::time::Duration;
 pub(crate) type ThreadProbe = Option<Arc<Mutex<HashSet<ThreadId>>>>;
 
 const WORKER_STAGGER_MS: u64 = 200;
+
+/// Error returned when a cycle's cooperative token is cancelled before a
+/// side effect (store / notification / webhook) can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CycleCancelled;
+
+impl std::fmt::Display for CycleCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cycle cancelled before side effect could run")
+    }
+}
+
+impl std::error::Error for CycleCancelled {}
 
 pub struct CycleStats {
     processed: AtomicUsize,
@@ -107,11 +121,32 @@ pub struct JobCtx<'a> {
     job: &'a Job,
     db: &'a Arc<Db>,
     runner: &'a Arc<Runner>,
+    token: Option<Arc<CycleToken>>,
 }
 
 impl<'a> JobCtx<'a> {
     pub fn new(job: &'a Job, db: &'a Arc<Db>, runner: &'a Arc<Runner>) -> Self {
-        Self { job, db, runner }
+        Self {
+            job,
+            db,
+            runner,
+            token: None,
+        }
+    }
+
+    /// Attach the active cycle's cancellation token. Every side-effecting
+    /// stage re-checks it immediately before running, so a result that became
+    /// late while an await was in flight can neither be stored nor notified.
+    pub(crate) fn with_token(mut self, token: Option<Arc<CycleToken>>) -> Self {
+        self.token = token;
+        self
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.token.as_ref().is_some_and(|t| t.is_cancelled()) {
+            return Err(anyhow::Error::new(CycleCancelled));
+        }
+        Ok(())
     }
 
     // One request lifecycle: ctx → telemetry → stages → finalize → on_success/on_error/on_finally → cleanup.
@@ -146,6 +181,10 @@ impl<'a> JobCtx<'a> {
         base_request: &RequestConfig,
         tel: &TelemetryHandle<'_>,
     ) -> Result<()> {
+        // A worker parked or scheduled right as the cycle was cancelled must
+        // not start a new fetch at all.
+        self.ensure_open()?;
+
         let request = match tel.hooks() {
             Some(h) => {
                 let Some(ctx) = tel.ctx() else { return Ok(()) };
@@ -304,6 +343,11 @@ impl<'a> JobCtx<'a> {
             None => items,
         };
 
+        // Late-result gate #1: a reload/timeout/shutdown that landed while
+        // extraction was in flight must not persist anything. The durable
+        // queue keeps the URL pending for the next cycle / restart.
+        self.ensure_open()?;
+
         let new_items = tel
             .stage(
                 "store",
@@ -331,6 +375,12 @@ impl<'a> JobCtx<'a> {
             color::c_ok(&format!("{} new items", new_items.len())),
             color::c_job(&self.job.config.name)
         );
+
+        // Late-result gate #2: store and notify are separate awaits. A
+        // cancellation landing in between must suppress the notification even
+        // though the rows are already committed (dedupe makes a re-run a no-op
+        // anyway, so no duplicate notification can ever be produced).
+        self.ensure_open()?;
 
         let notify_items = match tel.hooks() {
             Some(h) => {
@@ -363,6 +413,9 @@ impl<'a> JobCtx<'a> {
             }
             None => payload,
         };
+
+        // Late-result gate #3: same protection for the outbound webhook.
+        self.ensure_open()?;
 
         tel.stage(
             "webhook",
@@ -398,6 +451,9 @@ enum ErrStyle {
     Worker,
 }
 
+// The optional cycle token is threaded through so cooperative cancellation can
+// gate side effects; it is the eighth argument of this per-URL driver.
+#[allow(clippy::too_many_arguments)]
 async fn run_recorded(
     job: &Job,
     db: &Arc<Db>,
@@ -406,8 +462,9 @@ async fn run_recorded(
     worker_id: usize,
     stats: &CycleStats,
     style: ErrStyle,
+    token: Option<Arc<CycleToken>>,
 ) -> bool {
-    let ctx = JobCtx::new(job, db, runner);
+    let ctx = JobCtx::new(job, db, runner).with_token(token);
     match ctx.run_once(&request, worker_id).await {
         Ok(()) => {
             stats.record(true);
@@ -415,12 +472,20 @@ async fn run_recorded(
         }
         Err(e) => {
             stats.record(false);
-            match style {
-                ErrStyle::Inline => {
-                    crate::t_eprintln!("Job '{}' error: {}", color::c_job(&job.config.name), e);
-                }
-                ErrStyle::Worker => {
-                    crate::t_eprintln!("Job '{}' worker error: {}", job.config.name, e);
+            if e.downcast_ref::<CycleCancelled>().is_some() {
+                crate::t_println!(
+                    "Job '{}' cycle cancelled; late result for {} discarded",
+                    color::c_job(&job.config.name),
+                    request.url
+                );
+            } else {
+                match style {
+                    ErrStyle::Inline => {
+                        crate::t_eprintln!("Job '{}' error: {}", color::c_job(&job.config.name), e);
+                    }
+                    ErrStyle::Worker => {
+                        crate::t_eprintln!("Job '{}' worker error: {}", job.config.name, e);
+                    }
                 }
             }
             false
@@ -429,17 +494,18 @@ async fn run_recorded(
 }
 
 // One cycle's dispatch mechanics: plan → workers → stats.
-pub(crate) struct CycleRunner<'a> {
+pub struct CycleRunner<'a> {
     job: &'a Arc<Job>,
     db: &'a Arc<Db>,
     runner: &'a Arc<Runner>,
     ex: &'a Arc<Executor<'static>>,
     worker_count: usize,
     thread_probe: ThreadProbe,
+    control: Option<Arc<JobControl>>,
 }
 
 impl<'a> CycleRunner<'a> {
-    pub(crate) fn new(
+    pub fn new(
         job: &'a Arc<Job>,
         db: &'a Arc<Db>,
         runner: &'a Arc<Runner>,
@@ -453,6 +519,7 @@ impl<'a> CycleRunner<'a> {
             ex,
             worker_count,
             thread_probe: None,
+            control: None,
         }
     }
 
@@ -463,28 +530,108 @@ impl<'a> CycleRunner<'a> {
         self
     }
 
-    // Run exactly one job iteration: plan → dispatch → `on_finished`.
-    pub(crate) async fn run_iteration(&self) -> Arc<CycleStats> {
+    /// Install the per-job reload/cancellation control.
+    pub fn with_control(mut self, control: Arc<JobControl>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    /// Run exactly one job iteration: plan → dispatch → `on_finished`.
+    pub async fn run_iteration(&self) -> Arc<CycleStats> {
+        self.run_iteration_inner(None).await
+    }
+
+    /// Same as [`Self::run_iteration`], but cancels the cycle cooperatively
+    /// once `timeout` elapses. Late side effects are refused; unfinished queue
+    /// URLs remain durable and resume on the next cycle.
+    pub async fn run_iteration_with_timeout(&self, timeout: Duration) -> Arc<CycleStats> {
+        self.run_iteration_inner(Some(timeout)).await
+    }
+
+    async fn run_iteration_inner(&self, timeout: Option<Duration>) -> Arc<CycleStats> {
         // Every cycle starts with no active queue cycle — covers all modes
         // and makes a cancelled (dropped) previous cycle safe: its leftover
         // state is cleared before anything user-visible runs.
         if let Some(hooks) = self.job.hooks.as_ref() {
             hooks.queue.deactivate();
         }
+
+        // Install this cycle's cancellation token before any work begins.
+        let token = match &self.control {
+            Some(control) => control.begin_cycle(),
+            None => CycleToken::new(0),
+        };
+
         let work = Work::plan(self.job, self.worker_count).await;
-        let stats = self.dispatch(work).await;
+        let stats = Arc::new(CycleStats::new());
+
+        let timed_out = match timeout {
+            None => {
+                self.dispatch_with_token(work, Arc::clone(&stats), Arc::clone(&token))
+                    .await;
+                false
+            }
+            Some(limit) => {
+                let dispatch =
+                    self.dispatch_with_token(work, Arc::clone(&stats), Arc::clone(&token));
+                smol::future::or(
+                    async {
+                        dispatch.await;
+                        false
+                    },
+                    async {
+                        Timer::after(limit).await;
+                        true
+                    },
+                )
+                .await
+            }
+        };
+
+        if timed_out {
+            crate::t_warnln!(
+                "Job [{}] cycle timeout ({:?}) reached; cancelling cooperatively",
+                color::c_job(&self.job.config.name),
+                timeout.unwrap()
+            );
+            token.cancel();
+            if let Some(control) = &self.control {
+                control.cancel_current();
+            }
+        }
 
         if let Some(hooks) = self.job.hooks.as_ref() {
             hooks.run_on_finished(&stats).await;
             let _ = hooks.lua.lock().await.gc_collect();
         }
 
+        if let Some(control) = &self.control {
+            control.end_cycle();
+        }
         stats
     }
 
     // Total match on `Work`; stats always created here so `on_finished` fires (with zeros) on every path, including Idle.
+    // Production cycles go through `dispatch_with_token`; this is the test seam.
+    #[allow(dead_code)]
     pub(crate) async fn dispatch(&self, work: Work) -> Arc<CycleStats> {
+        let token = match &self.control {
+            Some(control) => control
+                .current_token()
+                .unwrap_or_else(|| CycleToken::new(0)),
+            None => CycleToken::new(0),
+        };
         let stats = Arc::new(CycleStats::new());
+        self.dispatch_with_token(work, stats.clone(), token).await;
+        stats
+    }
+
+    async fn dispatch_with_token(
+        &self,
+        work: Work,
+        stats: Arc<CycleStats>,
+        token: Arc<CycleToken>,
+    ) {
         match work {
             Work::Idle => {}
             Work::Inline(request) => {
@@ -496,32 +643,38 @@ impl<'a> CycleRunner<'a> {
                     1,
                     &stats,
                     ErrStyle::Inline,
+                    Some(token),
                 )
                 .await;
             }
             Work::Queue(batch) => {
                 let queue = self.job.hooks.as_ref().map(|h| Arc::clone(&h.queue));
-                self.run_queue_cycle(batch, stats.clone(), queue).await;
+                self.run_queue_cycle(batch, stats.clone(), queue, token)
+                    .await;
             }
             Work::Multi => {
-                self.spawn_multi_workers(&stats).await;
+                self.spawn_multi_workers(&stats, token).await;
             }
         }
-        stats
     }
 
     // Stagger → spawn → join for `Multi`: each worker runs the base request once.
-    async fn spawn_multi_workers(&self, stats: &Arc<CycleStats>) {
+    async fn spawn_multi_workers(&self, stats: &Arc<CycleStats>, token: Arc<CycleToken>) {
         let mut handles = Vec::with_capacity(self.worker_count);
         for i in 1..=self.worker_count {
             if i > 1 {
                 Timer::after(Duration::from_millis(WORKER_STAGGER_MS)).await;
+            }
+            // Workers that have not started when the cycle is cancelled never do.
+            if token.is_cancelled() {
+                break;
             }
             let worker_id = i;
             let job = Arc::clone(self.job);
             let db = Arc::clone(self.db);
             let runner = Arc::clone(self.runner);
             let stats = Arc::clone(stats);
+            let token = Arc::clone(&token);
             handles.push(spawn_worker(
                 self.ex,
                 async move {
@@ -534,6 +687,7 @@ impl<'a> CycleRunner<'a> {
                         worker_id,
                         &stats,
                         ErrStyle::Worker,
+                        Some(token),
                     )
                     .await;
                 },
@@ -546,26 +700,55 @@ impl<'a> CycleRunner<'a> {
         }
     }
 
-    // Queue-cycle engine: pending deque, visited set, in-flight count, worker
-    // handles. Inline in the cycle future — dropping it cancels workers.
+    // Queue-cycle engine: durable pending set, in-memory deque, visited set,
+    // in-flight count, worker handles. Inline in the cycle future — dropping it
+    // cancels workers; every URL is also persisted, so unfinished work resumes
+    // on the next cycle or after a process restart.
     async fn run_queue_cycle(
         &self,
         batch: Vec<String>,
         stats: Arc<CycleStats>,
         queue: Option<Arc<QueueState>>,
+        token: Arc<CycleToken>,
     ) {
         if self.worker_count == 0 {
             return;
         }
 
+        let job_id = self.job.config.id();
+        let durable = DurableQueue::new(Arc::clone(self.db), job_id.clone());
+
+        // Recover URLs left pending by an earlier interrupted cycle/process,
+        // then merge this cycle's seed. DB dedupe makes the union safe.
+        let recovered = durable.reclaim();
+        if !recovered.is_empty() {
+            crate::t_println!(
+                "Job [{}] resuming {} unfinished URL(s) from durable queue",
+                color::c_job(&self.job.config.name),
+                recovered.len()
+            );
+        }
+        let mut combined: VecDeque<String> = recovered.into();
+        for url in &batch {
+            if !combined.iter().any(|u| u == url) {
+                combined.push_back(url.clone());
+            }
+        }
+
+        // Persist the whole batch before any worker starts.
+        durable.enqueue(
+            &combined.iter().cloned().collect::<Vec<_>>(),
+            token.generation(),
+        );
+
         let (event_tx, event_rx) = unbounded::<Message>();
-        let mut pending: VecDeque<String> = batch.clone().into();
+        let mut pending: VecDeque<String> = combined;
         // Seed visited with the initial batch: re-pushing an initial URL is a
         // duplicate; duplicates *within* the initial batch keep processing
         // twice (today's behavior — the visited set gates pushes only).
-        let mut visited: HashSet<String> = batch.iter().cloned().collect();
+        let mut visited: HashSet<String> = pending.iter().cloned().collect();
         if let Some(q) = &queue {
-            q.begin_cycle(event_tx.clone(), visited.len());
+            q.begin_cycle(event_tx.clone(), visited.len(), Arc::clone(&token));
         }
 
         let mut replies: Vec<Sender<Reply>> = Vec::with_capacity(self.worker_count);
@@ -589,6 +772,8 @@ impl<'a> CycleRunner<'a> {
                     event_tx.clone(),
                     reply_rx,
                     i,
+                    Arc::clone(&token),
+                    Arc::clone(&durable),
                 ),
                 &self.thread_probe,
             ));
@@ -597,6 +782,14 @@ impl<'a> CycleRunner<'a> {
         while let Ok(msg) = event_rx.recv().await {
             match msg {
                 Message::RequestWork { worker_id } => {
+                    // Never hand out new URLs once the cycle is cancelling.
+                    if token.is_cancelled() {
+                        parked.push_back(worker_id);
+                        if in_flight == 0 {
+                            break;
+                        }
+                        continue;
+                    }
                     if let Some(url) = pending.pop_front() {
                         in_flight += 1;
                         let _ = replies[worker_id - 1].try_send(Reply::Work(url));
@@ -619,6 +812,12 @@ impl<'a> CycleRunner<'a> {
                         continue;
                     }
                     stats.record_pushed();
+                    if token.is_cancelled() {
+                        // Already durably enqueued by QueueState::push_url;
+                        // leave it for the next cycle to pick up.
+                        pending.push_back(url);
+                        continue;
+                    }
                     if let Some(worker_id) = parked.pop_front() {
                         in_flight += 1;
                         let _ = replies[worker_id - 1].try_send(Reply::Work(url));
@@ -644,6 +843,8 @@ impl<'a> CycleRunner<'a> {
         if let Some(q) = &queue {
             q.deactivate();
         }
+        // Anything still durably pending is intentionally retained: it is the
+        // recovery set for the next cycle / a restart. No explicit clear here.
     }
 }
 
@@ -653,6 +854,7 @@ enum Reply {
     Shutdown,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     job: Arc<Job>,
     db: Arc<Db>,
@@ -661,6 +863,8 @@ async fn worker_loop(
     event_tx: Sender<Message>,
     reply_rx: Receiver<Reply>,
     worker_id: usize,
+    token: Arc<CycleToken>,
+    durable: Arc<DurableQueue>,
 ) {
     loop {
         if event_tx
@@ -672,7 +876,7 @@ async fn worker_loop(
         match reply_rx.recv().await {
             Ok(Reply::Work(url)) => {
                 let request = RequestConfig {
-                    url,
+                    url: url.clone(),
                     ..RequestConfig::from_job(&job.config)
                 };
                 let ok = run_recorded(
@@ -683,14 +887,23 @@ async fn worker_loop(
                     worker_id,
                     &stats,
                     ErrStyle::Worker,
+                    Some(Arc::clone(&token)),
                 )
                 .await;
-                let msg = if ok {
-                    Message::Completed
-                } else {
-                    Message::Failed
-                };
-                if event_tx.try_send(msg).is_err() {
+
+                if ok {
+                    // Only a fully completed URL leaves the durable queue.
+                    // Cancellation errors keep the row for recovery.
+                    durable.complete(&url);
+                    if event_tx.try_send(Message::Completed).is_err() {
+                        return;
+                    }
+                } else if token.is_cancelled() {
+                    // Interrupted, not failed: the row stays pending for the
+                    // next cycle/restart; tell the coordinator and exit.
+                    let _ = event_tx.try_send(Message::Failed);
+                    return;
+                } else if event_tx.try_send(Message::Failed).is_err() {
                     return;
                 }
             }
@@ -699,17 +912,28 @@ async fn worker_loop(
     }
 }
 
-pub async fn run_job_loop(job: Job, db: Arc<Db>, runner: Arc<Runner>, ex: &Arc<Executor<'static>>) {
+pub async fn run_job_loop(
+    job: Job,
+    db: Arc<Db>,
+    runner: Arc<Runner>,
+    ex: &Arc<Executor<'static>>,
+    control: Arc<JobControl>,
+) {
     let interval = Duration::from_secs(job.config.options.interval as u64);
+    let cycle_timeout = match job.config.options.cycle_timeout_secs {
+        0 => None,
+        secs => Some(Duration::from_secs(secs as u64)),
+    };
     let worker_count = job.config.worker_count();
     let job = Arc::new(job);
-    let cycle = CycleRunner::new(&job, &db, &runner, ex, worker_count);
+    let cycle =
+        CycleRunner::new(&job, &db, &runner, ex, worker_count).with_control(Arc::clone(&control));
 
     loop {
         crate::t_println!("Running job: {}", color::c_job(&job.config.name));
         let started = std::time::Instant::now();
 
-        cycle.run_iteration().await;
+        run_one_cycle(&cycle, &control, cycle_timeout).await;
 
         let pipeline_elapsed = started.elapsed();
         crate::t_println!(
@@ -718,6 +942,58 @@ pub async fn run_job_loop(job: Job, db: Arc<Db>, runner: Arc<Runner>, ex: &Arc<E
             color::c_info(&crate::services::utils::format_duration(pipeline_elapsed)),
             color::c_info(&format!("{}s", job.config.options.interval))
         );
-        Timer::after(interval).await;
+
+        // A reload observed during the cycle (or during sleep) ends this task
+        // at the cycle boundary. The manager respawns the job from new config.
+        if control.reload_requested() {
+            control.acknowledge_reload();
+            crate::t_println!(
+                "Job [{}] handing over to reloaded config at cycle boundary",
+                color::c_job(&job.config.name)
+            );
+            return;
+        }
+
+        if sleep_interruptible(interval, &control).await {
+            control.acknowledge_reload();
+            crate::t_println!(
+                "Job [{}] reload requested during sleep; ending old task",
+                color::c_job(&job.config.name)
+            );
+            return;
+        }
     }
+}
+
+/// Run one cycle, enforcing the optional explicit timeout. On timeout the
+/// cycle token is cancelled inside the iteration: workers unwind at their next
+/// await boundary and every late side effect is refused.
+async fn run_one_cycle(
+    cycle: &CycleRunner<'_>,
+    _control: &Arc<JobControl>,
+    timeout: Option<Duration>,
+) {
+    match timeout {
+        Some(limit) => {
+            cycle.run_iteration_with_timeout(limit).await;
+        }
+        None => {
+            cycle.run_iteration().await;
+        }
+    }
+}
+
+/// Wait up to `interval`, returning early (true) when a reload is requested.
+async fn sleep_interruptible(interval: Duration, control: &Arc<JobControl>) -> bool {
+    let step = Duration::from_millis(200);
+    let mut remaining = interval;
+    while remaining > Duration::ZERO {
+        let chunk = remaining.min(step);
+        Timer::after(chunk).await;
+        if control.reload_requested() {
+            return true;
+        }
+        remaining = remaining.saturating_sub(chunk);
+    }
+    false
 }

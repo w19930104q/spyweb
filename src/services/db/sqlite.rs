@@ -32,6 +32,12 @@ fn create_tables(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS lua_user (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS queue_urls (
+            job_id     TEXT    NOT NULL,
+            url        TEXT    NOT NULL,
+            generation INTEGER NOT NULL,
+            PRIMARY KEY (job_id, url)
         );",
     )?;
     Ok(())
@@ -274,6 +280,64 @@ impl SqliteBackend {
             .collect();
         let changes = conn.execute(sql, param_refs.as_slice())?;
         Ok(changes as u64)
+    }
+
+    // Durable queue-cycle state. Every URL a queue cycle may process lives here
+    // for the lifetime of the cycle; rows are removed only when the URL
+    // completes. A process restart therefore re-enqueues every unfinished URL.
+    pub fn queue_enqueue(&self, job_id: &str, urls: &[String], generation: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO queue_urls (job_id, url, generation) VALUES (?1, ?2, ?3)",
+            )?;
+            for url in urls {
+                stmt.execute(rusqlite::params![job_id, url, generation])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn queue_reclaim(&self, job_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT url FROM queue_urls WHERE job_id = ?1 ORDER BY rowid ASC")?;
+        let rows = stmt.query_map(rusqlite::params![job_id], |row| row.get::<_, String>(0))?;
+        let mut urls = Vec::new();
+        for row in rows {
+            urls.push(row?);
+        }
+        Ok(urls)
+    }
+
+    pub fn queue_complete(&self, job_id: &str, url: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM queue_urls WHERE job_id = ?1 AND url = ?2",
+            rusqlite::params![job_id, url],
+        )?;
+        Ok(())
+    }
+
+    pub fn queue_clear(&self, job_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM queue_urls WHERE job_id = ?1",
+            rusqlite::params![job_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn queue_depth(&self, job_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM queue_urls WHERE job_id = ?1",
+            rusqlite::params![job_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 }
 
@@ -531,5 +595,87 @@ mod tests {
         // Newest-first ordering within each job
         let a_recs = limited.get(&id_a).unwrap();
         assert!(a_recs[0].timestamp > a_recs[1].timestamp);
+    }
+
+    #[test]
+    fn test_durable_queue_lifecycle_and_recovery() {
+        let tdb = TestDb::new("sqlite_test_durable_queue");
+        let job_id = "durable-job";
+
+        assert!(tdb.db().queue_reclaim(job_id).unwrap().is_empty());
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 0);
+
+        let urls = vec![
+            "https://a.test/1".to_string(),
+            "https://a.test/2".to_string(),
+            "https://a.test/3".to_string(),
+        ];
+        tdb.db().queue_enqueue(job_id, &urls, 1).unwrap();
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 3);
+
+        // INSERT OR IGNORE: duplicates are no-ops, original generation wins.
+        tdb.db()
+            .queue_enqueue(
+                job_id,
+                &[
+                    "https://a.test/2".to_string(),
+                    "https://a.test/4".to_string(),
+                ],
+                2,
+            )
+            .unwrap();
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 4);
+
+        let pending = tdb.db().queue_reclaim(job_id).unwrap();
+        for url in &urls {
+            assert!(pending.contains(url), "missing {url} after reclaim");
+        }
+        assert!(pending.contains(&"https://a.test/4".to_string()));
+
+        tdb.db().queue_complete(job_id, "https://a.test/1").unwrap();
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 3);
+        let pending = tdb.db().queue_reclaim(job_id).unwrap();
+        assert!(!pending.contains(&"https://a.test/1".to_string()));
+
+        tdb.db()
+            .queue_enqueue("other-job", &["https://b.test/x".to_string()], 1)
+            .unwrap();
+        assert_eq!(tdb.db().queue_depth("other-job").unwrap(), 1);
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 3);
+
+        tdb.db().queue_clear(job_id).unwrap();
+        assert_eq!(tdb.db().queue_depth(job_id).unwrap(), 0);
+        assert_eq!(tdb.db().queue_depth("other-job").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_durable_queue_survives_reopen() {
+        let path = "sqlite_test_durable_reopen.sqlite";
+        let _ = fs::remove_file(&path);
+
+        {
+            let db = SqliteBackend::open(path).unwrap();
+            db.queue_enqueue(
+                "restart-job",
+                &[
+                    "https://r.test/a".to_string(),
+                    "https://r.test/b".to_string(),
+                ],
+                7,
+            )
+            .unwrap();
+            db.queue_complete("restart-job", "https://r.test/a")
+                .unwrap();
+            db.close().unwrap();
+        }
+
+        // Simulate a process restart: reopen and recover the unfinished URL.
+        let reopened = SqliteBackend::open(path).unwrap();
+        let pending = reopened.queue_reclaim("restart-job").unwrap();
+        assert_eq!(pending, vec!["https://r.test/b".to_string()]);
+        drop(reopened);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(format!("{path}-wal"));
+        let _ = fs::remove_file(format!("{path}-shm"));
     }
 }

@@ -1,22 +1,42 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::{fs, path::Path};
 
 use crate::config;
 use crate::config::validate;
 use crate::lua::hooks::JobHooks;
+use crate::scraper::control::JobControl;
 use crate::services::db::Db;
 use anyhow::Result;
 use config::types::{Job, JobConfig, JobFile, Jobs};
 
-pub fn load_all_jobs(file_path: &str, dir_path: &str, db: Arc<Db>) -> Result<Jobs> {
+/// Registry mapping a stable job id to its process-lifetime control.
+///
+/// Job ids survive hot reload, so a control created on first load is reused by
+/// every subsequent rebuild of the job's config and Lua VM. This is what lets a
+/// reload observed mid-cycle reach the still-running, old-config cycle.
+pub type JobControls = Arc<RwLock<HashMap<String, Arc<JobControl>>>>;
+
+/// Fresh, empty registry. The running engine shares one registry across every
+/// reload; one-shot CLI paths (`debug`, `profile`, tests) create their own.
+pub fn empty_controls() -> JobControls {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+pub fn load_all_jobs(
+    file_path: &str,
+    dir_path: &str,
+    db: Arc<Db>,
+    controls: JobControls,
+) -> Result<Jobs> {
     let mut list = load_config_from_file(file_path)?;
-    list.extend(load_config_from_dir(dir_path, db)?);
+    list.extend(load_config_from_dir(dir_path, db, controls)?);
     validate::validate_job_set(&list)?;
     Ok(Jobs { list })
 }
 
-pub fn load_dir_jobs(dir_path: &str, db: Arc<Db>) -> Result<Vec<Job>> {
-    load_config_from_dir(dir_path, db)
+pub fn load_dir_jobs(dir_path: &str, db: Arc<Db>, controls: JobControls) -> Result<Vec<Job>> {
+    load_config_from_dir(dir_path, db, controls)
 }
 
 fn load_config_from_file(path: &str) -> Result<Vec<Job>> {
@@ -43,7 +63,7 @@ fn load_config_from_file(path: &str) -> Result<Vec<Job>> {
     Ok(jobs)
 }
 
-fn load_config_from_dir(path: &str, db: Arc<Db>) -> Result<Vec<Job>> {
+fn load_config_from_dir(path: &str, db: Arc<Db>, controls: JobControls) -> Result<Vec<Job>> {
     let mut jobs: Vec<Job> = vec![];
     let base = Path::new(path);
     if !base.exists() {
@@ -66,8 +86,16 @@ fn load_config_from_dir(path: &str, db: Arc<Db>) -> Result<Vec<Job>> {
         validate::validate_job_config(&config)?;
         let hook_path = dir.join("hooks.lua");
         let has_hooks_file = hook_path.exists();
+
+        // Reuse the same control across reloads; create one on first sight.
+        let job_id = config.id();
+        let control = {
+            let mut registry = controls.write().unwrap_or_else(|e| e.into_inner());
+            registry.entry(job_id.clone()).or_default().clone()
+        };
+
         let hooks = if config.options.enabled && has_hooks_file {
-            match JobHooks::load(&hook_path, Arc::clone(&db), &config.id()) {
+            match JobHooks::load(&hook_path, Arc::clone(&db), &job_id, control) {
                 Ok(h) => Some(h),
                 Err(e) => {
                     crate::t_eprintln!("Failed to load hooks for '{}': {}", config.name, e);

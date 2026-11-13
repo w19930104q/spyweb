@@ -22,6 +22,7 @@ SpyWeb validates config statically before startup or reload. It checks required 
 | `headers` | table | *none* | Custom HTTP headers |
 | `workers` | u32 | `1` | Per-job worker concurrency |
 | `urls` | string[] | *none* | Multiple entry URLs (overrides `url` for multi-page entry) |
+| `cycle_timeout_secs` | u32 | `0` | Explicit upper bound for one job cycle. `0` waits for the cycle to finish naturally; when elapsed the cycle is cancelled cooperatively (see [Lifecycle](./lifecycle.md)) |
 | `proxy` | table | *none* | Proxy configuration |
 | `webhook` | table | *none* | Webhook configuration |
 | `notification` | table | *auto* | Desktop notification settings |

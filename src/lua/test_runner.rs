@@ -26,7 +26,7 @@ async fn run_tests_async(
     let temp_db_file = NamedTempFile::new()?;
     let dummy_db = Arc::new(Db::open(&temp_db_file.path().to_string_lossy())?); // Needed for loader
     let jobs = Jobs {
-        list: loader::load_dir_jobs("jobs", dummy_db.clone())?,
+        list: loader::load_dir_jobs("jobs", dummy_db.clone(), loader::empty_controls())?,
     };
 
     // "server" is a reserved selector that targets the programmable API server's
@@ -230,6 +230,7 @@ pub async fn run_single_test(job_dir: &Path, job_name: &str, test_name: &str) ->
         hook_path: job_dir.join("hooks.lua"),
         hook_mask: 0,
         queue: crate::scraper::coordinator::QueueState::new(),
+        control: crate::scraper::control::JobControl::new(),
     };
 
     let ctx = hooks.new_cycle_context(0).await?;

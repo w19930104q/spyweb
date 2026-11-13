@@ -1,4 +1,10 @@
+#[allow(clippy::duplicate_mod)]
+#[path = "shared/mod.rs"]
 mod helpers;
+
+// Hot-reload / cooperative-cancel / durable-recovery scenarios.
+#[path = "reload_recovery.rs"]
+mod reload_recovery;
 
 use helpers::{DbVariant, MockServer, TestEnv};
 use spyweb::lua::server::ApiServer;

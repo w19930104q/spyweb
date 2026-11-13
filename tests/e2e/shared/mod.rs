@@ -1,3 +1,8 @@
+// Included via `#[path]` by more than one e2e test target. Each target compiles
+// this module on its own and only uses a subset of the helpers, so items used
+// exclusively by another target look dead here. Shared test utilities, hence:
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -98,6 +103,7 @@ pub struct TestEnv {
     pub _dir: TempDir,
     pub db: Arc<Db>,
     pub jobs_dir: std::path::PathBuf,
+    db_path: std::path::PathBuf,
 }
 
 impl TestEnv {
@@ -125,7 +131,23 @@ impl TestEnv {
             _dir: dir,
             db,
             jobs_dir,
+            db_path,
         }
+    }
+
+    /// Filesystem path of the backing database. Used by restart tests to close
+    /// the live handle and reopen the same database file.
+    pub fn db_path(&self) -> String {
+        self.db_path.to_str().expect("invalid db path").to_string()
+    }
+
+    /// Close and reopen the backing database on the same file, simulating a
+    /// process restart. Durable queue rows and the dedupe tables must survive.
+    pub fn reopen_db(&mut self) {
+        self.db
+            .close()
+            .expect("database must close cleanly before reopen");
+        self.db = Arc::new(Db::open(&self.db_path()).expect("failed to reopen db"));
     }
 
     /// Change CWD to the temp directory for the lifetime of the returned guard.
@@ -134,6 +156,7 @@ impl TestEnv {
         let jobs = loader::load_dir_jobs(
             self.jobs_dir.to_str().expect("invalid path"),
             self.db.clone(),
+            loader::empty_controls(),
         )
         .expect("failed to load jobs");
 
@@ -215,6 +238,26 @@ impl TestEnv {
         };
         smol::block_on(async {
             h.with_lua(|lua: &mlua::Lua| lua.globals().get::<String>(key).ok())
+                .await
+        })
+    }
+
+    pub fn set_global_u64(&self, job: &Job, key: &str, val: u64) {
+        let Some(h) = job.hooks.as_ref() else {
+            return;
+        };
+        smol::block_on(async {
+            h.with_lua(|lua: &mlua::Lua| {
+                let _ = lua.globals().set(key, val);
+            })
+            .await;
+        });
+    }
+
+    pub fn read_global_u64(&self, job: &Job, key: &str) -> Option<u64> {
+        let h = job.hooks.as_ref()?;
+        smol::block_on(async {
+            h.with_lua(|lua: &mlua::Lua| lua.globals().get::<u64>(key).ok())
                 .await
         })
     }

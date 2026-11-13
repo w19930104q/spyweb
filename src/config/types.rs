@@ -44,6 +44,14 @@ pub struct JobOptions {
     pub workers: Option<usize>,
     #[serde(default)]
     pub urls: Option<Vec<String>>,
+
+    /// Explicit upper bound for one job cycle (on_start → workers → on_finished)
+    /// in seconds. `0` (default) means wait for the cycle to finish naturally.
+    /// When elapsed, the cycle is cancelled cooperatively: late results are
+    /// refused at every side-effect boundary, unfinished URLs stay in the
+    /// durable queue and the next cycle (or a restart) resumes them.
+    #[serde(default)]
+    pub cycle_timeout_secs: u32,
 }
 
 impl Default for JobOptions {
@@ -61,6 +69,7 @@ impl Default for JobOptions {
             hash_fields: None,
             workers: None,
             urls: None,
+            cycle_timeout_secs: 0,
         }
     }
 }

@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::config::loader;
 use crate::config::types::{Job, JobConfig, Jobs};
 use crate::scraper::extractor::{ExtractedItem, Extractor, write_debug_artifacts};
 use crate::scraper::pipeline::compute_cycle_batch;
@@ -123,7 +124,8 @@ async fn resolve_debug_target(job: &Job) -> DebugTarget {
 
 pub async fn debug_job(job_name: &str) -> Result<()> {
     let db = Arc::new(Db::open("data")?);
-    let mut jobs = crate::config::loader::load_all_jobs("jobs.toml", "jobs", db)?;
+    let mut jobs =
+        crate::config::loader::load_all_jobs("jobs.toml", "jobs", db, loader::empty_controls())?;
 
     let search_id = crate::config::types::normalize_job_id(job_name);
 

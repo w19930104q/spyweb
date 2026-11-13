@@ -268,3 +268,34 @@ end
 ## Memory Hygiene
 
 SpyWeb automatically wipes transient cycle state like `last_fetch` and `selector_matches` from the per-cycle context after `on_finally` returns to keep the memory footprint low during sleep intervals. Job-level state persists across cycles and is available in `on_finished()`.
+
+---
+
+## Hot Reload, Cooperative Cancellation & Durable Recovery
+
+Editing the config while SpyWeb runs triggers a **cooperative** reload, not a hard interrupt. The design has four guarantees:
+
+1. **New config applies at the next cycle boundary.** A reload never cancels the cycle already in flight — that cycle keeps running under the old config and closes out naturally. Only once every worker reaches the end of its cycle does the manager rebuild the Lua VM/config and respawn the job.
+2. **A cycle may be bounded by an explicit timeout.** Set `cycle_timeout_secs` (per job) to cap one cycle. When it elapses the cycle is *cancelled cooperatively*: workers unwind at their next `await` rather than being killed mid-operation. `0` (the default) means wait for the cycle to finish naturally.
+3. **Late results are never stored or notified.** Each cycle installs a one-shot `CycleToken` before any work begins. Every side-effecting step — the database insert, desktop/webhook notification, and the Lua `notify` global — checks the token immediately before running. A closed token (from a timeout, reload drain, or shutdown) makes the store/notify path refuse, so a result that lands after cancellation cannot produce a duplicate row or alert.
+4. **Unfinished work survives in the database.** Every accepted URL is written to a durable `queue_urls` table *before* it is dispatched, and a row is removed only when that URL completes. A cancelled cycle therefore leaves its unfinished URLs persisted. On the next cycle — or after a full process restart — the job reclaims them and resumes; the dedupe (`seen`) table makes the rerun idempotent, so nothing is stored or notified twice.
+
+### Epoch-based reload handoff
+
+A single per-job `JobControl` lives for the whole process lifetime of a stable job id; hot reload rebuilds the config and Lua VM but keeps this control in place, which is how a reload signal reaches the old-config cycle that is still running.
+
+- The reload state is a monotonic **epoch**. `request_reload()` bumps it; the job loop records the epoch it last observed. Because `begin_cycle()` never touches the epoch, a reload that lands *between* cycles (while no token is installed) cannot be silently swallowed.
+- The loop acknowledges the reload only when it is about to hand back to the manager. The manager re-arms the control when it (re)spawns a task, so a fresh task never inherits a reload meant for the previous task.
+
+### Drain and force-cancel backstop
+
+On reload the manager waits for old tasks to reach their cycle boundary. The drain deadline is the largest configured `cycle_timeout_secs` plus a fixed grace window (at least the grace window when no job sets a timeout). Any task still running past the deadline has its token force-cancelled and gets a short unwind window; dropping the task remains the final backstop, and it is safe precisely because the cancelled token already gates off every side effect. Browsers owned by the old Lua VMs are torn down only *after* the old tasks have unwound.
+
+On shutdown the same path runs: all active tokens are cancelled first (closing every side-effect gate), then tasks are drained for the grace window before the process exits.
+
+### What this means for hooks
+
+- `override_fetch` / `defer.lua` callbacks that call `notify` after a cycle was cancelled receive a runtime error (`"notify skipped: current cycle is cancelled or finished"`) instead of sending an alert.
+- URLs pushed via `queue_push` are durable like any seed URL: if the cycle ends before they run, they are reclaimed rather than lost.
+- Re-running the same URLs after an interruption is safe — the dedupe table suppresses duplicate rows, and a suppressed row means no second notification.
+

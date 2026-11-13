@@ -1,5 +1,6 @@
 use crate::lua::engine;
-use crate::scraper::coordinator::{PushError, QueueState};
+use crate::scraper::control::JobControl;
+use crate::scraper::coordinator::{DurableQueue, PushError, QueueState};
 use crate::services::db::Db;
 use anyhow::Result;
 use mlua::{Lua, Table, Value};
@@ -102,6 +103,10 @@ pub struct JobHooks {
     pub(crate) hook_path: PathBuf,
     pub(crate) hook_mask: u16,
     pub(crate) queue: Arc<QueueState>,
+    /// Retained for side-effect gates reachable through this hook set (e.g.
+    /// the `notify` override installed in [`JobHooks::load`]); exposed via
+    /// [`JobHooks::control`].
+    pub(crate) control: Arc<JobControl>,
 }
 
 impl std::fmt::Debug for JobHooks {
@@ -142,7 +147,12 @@ impl std::error::Error for LuaHookError {
 }
 
 impl JobHooks {
-    pub fn load(path: &Path, db: Arc<Db>, job_name: &str) -> Result<Self> {
+    pub fn load(
+        path: &Path,
+        db: Arc<Db>,
+        job_name: &str,
+        control: Arc<JobControl>,
+    ) -> Result<Self> {
         let job_dir = path.parent().map(|p| p.to_path_buf());
         let source = std::fs::read_to_string(path)?;
         let defer_path = path.with_file_name("defer.lua");
@@ -160,9 +170,10 @@ impl JobHooks {
                 .map(source_uses_cdp)
                 .unwrap_or(false);
 
-        let lua = engine::create_engine(job_dir, db, job_name, uses_cdp)?;
+        let lua = engine::create_engine(job_dir, Arc::clone(&db), job_name, uses_cdp)?;
 
-        let queue = QueueState::new();
+        let durable = DurableQueue::new(Arc::clone(&db), job_name.to_string());
+        let queue = QueueState::with_durable(Arc::clone(&durable));
         {
             let q = Arc::clone(&queue);
             lua.globals().set(
@@ -177,6 +188,36 @@ impl JobHooks {
                         }
                     })
                 })?,
+            )?;
+        }
+        {
+            // Lua `notify()` is a side effect: a cancelled cycle must not be
+            // able to emit desktop notifications from a late callback (e.g. an
+            // old defer.lua still running across a reload or restart).
+            let control = Arc::clone(&control);
+            lua.globals().set(
+                "notify",
+                lua.create_async_function(
+                    move |_, (title, body, timeout): (String, String, Option<u32>)| {
+                        let control = Arc::clone(&control);
+                        async move {
+                            if !control.side_effects_open() {
+                                return Err(mlua::Error::runtime(
+                                    "notify skipped: current cycle is cancelled or finished",
+                                ));
+                            }
+                            smol::unblock(move || {
+                                crate::services::notifier::send_notification(
+                                    &title,
+                                    &body,
+                                    timeout.unwrap_or(5000),
+                                )
+                                .map_err(|e| mlua::Error::runtime(format!("notify failed: {e}")))
+                            })
+                            .await
+                        }
+                    },
+                )?,
             )?;
         }
 
@@ -258,6 +299,7 @@ impl JobHooks {
             hook_mask,
             lua: Mutex::new(lua),
             queue,
+            control,
         })
     }
 
@@ -275,6 +317,13 @@ impl JobHooks {
 
     pub fn has_on_start(&self) -> bool {
         self.hook_mask & HOOK_ON_START != 0
+    }
+
+    /// The process-lifetime reload/cancellation control bound to this hook
+    /// set's job id. Side-effect gates (e.g. the `notify` override) consult
+    /// it; tests drive cooperative reload through the same handle.
+    pub fn control(&self) -> Arc<JobControl> {
+        Arc::clone(&self.control)
     }
 
     pub async fn new_cycle_context(&self, worker_id: usize) -> Result<Table> {
@@ -633,6 +682,22 @@ impl JobHooks {
     {
         let lua = self.lua.lock().await;
         f(&lua)
+    }
+
+    /// Call a global (possibly async) Lua function with the given argument
+    /// tuple, releasing the Lua lock while the call is in flight so async
+    /// bindings such as the gated `notify` can make progress.
+    /// Used by the integration tests for side-effect gate assertions.
+    pub async fn call_global<A, T>(&self, name: &str, args: A) -> mlua::Result<T>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + 'static,
+    {
+        let lua = self.lua.lock().await;
+        let func: mlua::Function = lua.globals().get(name)?;
+        let pending = func.call_async::<T>(args);
+        drop(lua);
+        pending.await
     }
 }
 
